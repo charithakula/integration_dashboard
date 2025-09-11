@@ -1,0 +1,53 @@
+# Core Flask Application (Latest LTS)
+Flask==3.1.2
+Flask-CORS==6.0.1
+Werkzeug==3.1.0
+
+# Splunk Integration
+splunk-sdk==2.1.1
+
+# Data Processing and Analysis
+pandas==2.3.2
+numpy==2.3.3
+
+# PDF Generation
+reportlab==4.4.3
+
+# Task Scheduling
+schedule==1.2.2
+
+# Environment Management
+python-dotenv==1.1.1
+
+# Production Server
+gunicorn==23.0.0
+
+# HTTP Requests (for fallback API calls)
+requests==2.32.5
+
+# Data Validation and Serialization
+marshmallow==3.20.1
+
+# Monitoring and Metrics
+prometheus-client==0.22.1
+
+# Structured Logging
+structlog==25.4.0
+
+# Date and Time Utilities
+python-dateutil==2.9.0.post0
+
+# Additional Production Dependencies
+psutil==6.1.1        # System monitoring
+certifi==2024.12.14  # SSL certificates
+urllib3==2.2.3       # HTTP library
+
+# Development and Testing (optional - install with: pip install -r requirements-dev.txt)
+# pytest==8.3.4
+# pytest-flask==1.3.0
+# black==24.12.0
+# flake8==7.1.1
+# mypy==1.13.0
+
+# Security
+cryptography==44.0.0
