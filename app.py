@@ -77,21 +77,15 @@ ACTIVE_CONNECTIONS = Gauge('active_connections', 'Active connections')
 # Initialize Flask App
 app = Flask(__name__)
 
-# Simple Configuration - NO ENCRYPTION
+# Configuration - Token Authentication Only
 class Config:
     SECRET_KEY = os.getenv('SECRET_KEY', 'dev-secret-key-change-in-production')
     
-    # Splunk Configuration - Token-based Authentication
+    # Splunk Configuration - Token Authentication Only
     SPLUNK_HOST = os.getenv('SPLUNK_HOST', 'localhost')
     SPLUNK_PORT = int(os.getenv('SPLUNK_PORT', '8089'))
     SPLUNK_SCHEME = os.getenv('SPLUNK_SCHEME', 'https')
-    
-    # Primary: Token-based authentication (preferred)
     SPLUNK_AUTH_TOKEN = os.getenv('SPLUNK_AUTH_TOKEN')
-    
-    # Fallback: Username/password authentication
-    SPLUNK_USERNAME = os.getenv('SPLUNK_USERNAME', 'admin')
-    SPLUNK_PASSWORD = os.getenv('SPLUNK_PASSWORD', 'changeme')
     
     # Cache Configuration (In-Memory Only)
     CACHE_TTL = int(os.getenv('CACHE_TTL', '300'))  # 5 minutes
@@ -119,31 +113,30 @@ class CustomQuerySchema(Schema):
     time_range = fields.Str(missing='30d')
     environment = fields.Str(missing='prod')
 
-# FIXED: Enhanced SplunkConnector with better error handling and fallback
+# Simplified SplunkConnector - Token Authentication Only
 class SplunkConnector:
     def __init__(self, config: Dict[str, Any]):
         self.config = {
             'host': config['SPLUNK_HOST'],
             'port': config['SPLUNK_PORT'],
             'scheme': config['SPLUNK_SCHEME'],
-            'auth_token': config.get('SPLUNK_AUTH_TOKEN'),
-            'username': config.get('SPLUNK_USERNAME'),
-            'password': config.get('SPLUNK_PASSWORD')
+            'auth_token': config.get('SPLUNK_AUTH_TOKEN')
         }
         self.base_url = f"{self.config['scheme']}://{self.config['host']}:{self.config['port']}"
-        self.session_key = None
-        self.session_expiry = None
         self.connection_attempts = 0
         self.max_retries = 3
         self.last_connection_attempt = None
-        self.connection_cooldown = 30  # seconds
+        self.connection_cooldown = 30
         
         # Create a requests session for connection pooling
         self.session = requests.Session()
         self.session.verify = False  # Set to True in production with proper SSL
         
-        # FIXED: Don't auto-connect in constructor to avoid blocking startup
-        logger.info("SplunkConnector initialized", host=self.config['host'])
+        # Validate token exists
+        if not self.config.get('auth_token'):
+            logger.warning("No SPLUNK_AUTH_TOKEN provided - will use mock data")
+        else:
+            logger.info("SplunkConnector initialized with token authentication", host=self.config['host'])
     
     def should_attempt_connection(self):
         """Check if we should attempt a connection based on cooldown"""
@@ -151,132 +144,91 @@ class SplunkConnector:
             return True
         return time.time() - self.last_connection_attempt > self.connection_cooldown
     
-    def generate_session_id(self):
-        """Generate SID using authorization token with better error handling"""
+    def test_connection(self):
+        """Test token authentication by running a simple search"""
+        if not self.config.get('auth_token'):
+            logger.warning("No auth token available for connection test")
+            return False
+            
         if not self.should_attempt_connection():
-            logger.debug("Connection attempt skipped due to cooldown")
+            logger.debug("Connection test skipped due to cooldown")
             return False
             
         self.last_connection_attempt = time.time()
-        auth_url = f"{self.base_url}/services/auth/login"
         
         try:
-            # Prepare authentication data
-            if self.config.get('auth_token'):
-                # Token-based authentication
-                auth_data = {
-                    'output_mode': 'json'
-                }
-                headers = {
-                    'Authorization': f'Bearer {self.config["auth_token"]}',
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                }
-                logger.info("Attempting token-based authentication", url=auth_url)
-            else:
-                # Fallback to username/password
-                auth_data = {
-                    'username': self.config['username'],
-                    'password': self.config['password'],
-                    'output_mode': 'json'
-                }
-                headers = {
-                    'Content-Type': 'application/x-www-form-urlencoded'
-                }
-                logger.info("Attempting username/password authentication", url=auth_url)
+            search_url = f"{self.base_url}/services/search/jobs"
             
-            # Make authentication request with shorter timeout
+            search_data = {
+                'search': '| stats count',
+                'output_mode': 'json',
+                'exec_mode': 'blocking',
+                'timeout': 10
+            }
+            
+            headers = {
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Authorization': f'Bearer {self.config["auth_token"]}'
+            }
+            
+            logger.info("Testing Splunk connection with token")
+            
             response = self.session.post(
-                auth_url,
-                data=auth_data,
+                search_url,
+                data=search_data,
                 headers=headers,
-                timeout=10  # Reduced timeout
+                timeout=15
             )
             
             response.raise_for_status()
-            auth_result = response.json()
+            search_result = response.json()
             
-            # Extract session key
-            if 'sessionKey' in auth_result:
-                self.session_key = auth_result['sessionKey']
-                # Set expiry (typically 1 hour from now)
-                self.session_expiry = datetime.now() + timedelta(hours=1)
-                
-                logger.info("Successfully generated session ID", 
-                          session_key_prefix=self.session_key[:10] + "...",
-                          expires_at=self.session_expiry.isoformat())
+            if 'sid' in search_result:
+                logger.info("Token authentication test successful", sid=search_result['sid'])
+                self.connection_attempts = 0
                 return True
             else:
-                logger.error("No session key in authentication response", response=auth_result)
+                logger.error("Token test failed - no SID returned")
                 return False
                 
-        except requests.exceptions.RequestException as e:
-            logger.error("Authentication request failed", error=str(e), url=auth_url)
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 401:
+                logger.error("Token authentication failed - invalid token")
+            else:
+                logger.error("HTTP error during connection test", status=e.response.status_code, error=str(e))
+            self.connection_attempts += 1
             return False
         except Exception as e:
-            logger.error("Unexpected authentication error", error=str(e))
+            logger.error("Connection test failed", error=str(e))
+            self.connection_attempts += 1
             return False
-    
-    def is_session_valid(self):
-        """Check if current session is still valid"""
-        if not self.session_key:
-            return False
-        
-        if self.session_expiry and datetime.now() >= self.session_expiry:
-            logger.info("Session expired, need to re-authenticate")
-            return False
-        
-        return True
     
     def connect(self):
-        """Enhanced connection with better retry logic"""
-        if not self.should_attempt_connection():
+        """Test connection - simplified since tokens don't require session setup"""
+        if not self.config.get('auth_token'):
+            logger.warning("No auth token provided, skipping connection")
             return False
             
         while self.connection_attempts < self.max_retries:
-            try:
-                # Generate session ID first
-                if not self.generate_session_id():
-                    raise Exception("Failed to generate session ID")
-                
+            if self.test_connection():
                 ACTIVE_CONNECTIONS.inc()
-                logger.info("Successfully connected to Splunk with SID", 
-                          host=self.config['host'], 
-                          attempt=self.connection_attempts + 1,
-                          session_key_prefix=self.session_key[:10] + "...")
-                self.connection_attempts = 0
+                logger.info("Successfully connected to Splunk", host=self.config['host'])
                 return True
-                
-            except Exception as e:
-                self.connection_attempts += 1
-                logger.error("Failed to connect to Splunk", 
-                           error=str(e), 
-                           attempt=self.connection_attempts,
-                           max_retries=self.max_retries)
-                
-                # Clear invalid session
-                self.session_key = None
-                self.session_expiry = None
-                
-                if self.connection_attempts < self.max_retries:
-                    time.sleep(min(2 ** self.connection_attempts, 10))  # Cap backoff at 10s
-                
+            
+            if self.connection_attempts < self.max_retries:
+                wait_time = min(2 ** self.connection_attempts, 10)
+                logger.info(f"Connection failed, retrying in {wait_time}s", attempt=self.connection_attempts + 1)
+                time.sleep(wait_time)
+        
+        logger.error("Failed to connect to Splunk after all retries", max_retries=self.max_retries)
         return False
     
-    def ensure_valid_session(self):
-        """Ensure we have a valid session before making API calls"""
-        if not self.is_session_valid():
-            logger.info("Session invalid, reconnecting...")
-            return self.connect()
-        return True
-    
-    # FIXED: Enhanced execute_query with better error handling and mock fallback
     def execute_query(self, query: str, earliest_time: str = "-30d@d", 
                      latest_time: str = "now", timeout: int = 30) -> List[Dict]:
-        """Execute query with enhanced error handling and automatic fallback"""
+        """Execute query using search endpoint with token authentication"""
         
-        # FIXED: Don't ensure session on every query - just check if we have one
-        if not self.session_key:
-            logger.warning("No Splunk session available, skipping query execution")
+        if not self.config.get('auth_token'):
+            logger.warning("No auth token available for query execution")
             return []
         
         start_time = time.time()
@@ -287,10 +239,10 @@ class SplunkConnector:
             if any(keyword in query.lower() for keyword in dangerous_keywords):
                 raise ValueError(f"Query contains potentially dangerous operations")
             
-            # Prepare search URL and data
+            # Use the working search endpoint
             search_url = f"{self.base_url}/services/search/jobs"
             
-            # Prepare the search query with time bounds
+            # Prepare the search query
             full_query = f"search {query} earliest={earliest_time} latest={latest_time}"
             
             search_data = {
@@ -302,11 +254,11 @@ class SplunkConnector:
             
             headers = {
                 'Content-Type': 'application/x-www-form-urlencoded',
-                'Authorization': f'Bearer {self.session_key}'
+                'Authorization': f'Bearer {self.config["auth_token"]}'
             }
             
-            logger.info("Executing Splunk query via HTTP API", 
-                       query_preview=query[:50],  # Shortened for cleaner logs
+            logger.info("Executing Splunk query", 
+                       query_preview=query[:50],
                        earliest_time=earliest_time,
                        latest_time=latest_time)
             
@@ -315,7 +267,7 @@ class SplunkConnector:
                 search_url,
                 data=search_data,
                 headers=headers,
-                timeout=timeout + 5  # Reduced buffer
+                timeout=timeout + 5
             )
             
             response.raise_for_status()
@@ -328,19 +280,20 @@ class SplunkConnector:
                 return []
             
             job_sid = search_result['sid']
+            logger.info("Search job created successfully", job_sid=job_sid)
             
             # Get results using the SID
             results_url = f"{self.base_url}/services/search/jobs/{job_sid}/results"
             results_params = {
                 'output_mode': 'json',
-                'count': 1000  # Limit results to prevent memory issues
+                'count': 1000
             }
             
             results_response = self.session.get(
                 results_url,
                 params=results_params,
                 headers=headers,
-                timeout=15  # Shorter timeout for results
+                timeout=15
             )
             
             results_response.raise_for_status()
@@ -374,14 +327,11 @@ class SplunkConnector:
         except requests.exceptions.HTTPError as e:
             execution_time = time.time() - start_time
             
-            # Handle specific HTTP errors
             if e.response.status_code == 401:
-                logger.warning("Authentication error, clearing session", error=str(e))
-                self.session_key = None
-                self.session_expiry = None
-                SPLUNK_QUERY_COUNT.labels(query_type='error', status='auth_expired').inc()
+                logger.warning("Authentication error - invalid or expired token", error=str(e))
+                SPLUNK_QUERY_COUNT.labels(query_type='error', status='auth_failed').inc()
             elif e.response.status_code == 403:
-                logger.error("Permission denied", error=str(e))
+                logger.error("Permission denied - token lacks required permissions", error=str(e))
                 SPLUNK_QUERY_COUNT.labels(query_type='error', status='permission_denied').inc()
             else:
                 logger.error("HTTP error executing Splunk query", 
@@ -405,31 +355,24 @@ class SplunkConnector:
             return []
     
     def get_session_status(self):
-        """Get current session status for monitoring"""
+        """Get current authentication status"""
         return {
-            'has_session_key': bool(self.session_key),
-            'session_key_prefix': self.session_key[:10] + "..." if self.session_key else None,
-            'session_expiry': self.session_expiry.isoformat() if self.session_expiry else None,
-            'session_valid': self.is_session_valid(),
+            'auth_method': 'token',
+            'has_auth_token': bool(self.config.get('auth_token')),
+            'token_prefix': self.config['auth_token'][:10] + "..." if self.config.get('auth_token') else None,
             'connection_attempts': self.connection_attempts,
-            'service_connected': bool(self.session_key),
+            'service_connected': self.connection_attempts < self.max_retries,
             'last_connection_attempt': self.last_connection_attempt
         }
-    
-    def test_connection(self):
-        """Test connection with a minimal query"""
-        try:
-            test_query = "index=* | head 1"
-            result = self.execute_query(test_query, "-1m@m", "now", 10)
-            return len(result) >= 0  # Even 0 results means connection works
-        except Exception as e:
-            logger.error("Connection test failed", error=str(e))
-            return False
 
 # Initialize Splunk connector
-splunk = SplunkConnector(app.config)
+try:
+    splunk = SplunkConnector(app.config)
+except Exception as e:
+    logger.error("Failed to initialize SplunkConnector", error=str(e))
+    splunk = None
 
-# FIXED: Enhanced cache functions with better key management
+# Enhanced cache functions with better key management
 def get_cache_key(prefix: str, **kwargs) -> str:
     """Generate cache key from parameters"""
     sorted_params = sorted(kwargs.items())
@@ -497,7 +440,6 @@ def cache_result(cache_prefix: str, ttl: int = None, use_mock_on_failure: bool =
                     logger.debug("Cache miss - stored result", function=func.__name__, cache_key=cache_key)
                     return result
                 elif use_mock_on_failure:
-                    # FIXED: Return mock data if real function returns empty result
                     logger.warning("Function returned empty result, using mock data", function=func.__name__)
                     mock_result = get_mock_data()
                     return mock_result
@@ -524,7 +466,7 @@ def after_request(response):
         REQUEST_DURATION.observe(duration)
     return response
 
-# FIXED: Updated Splunk Queries with better error handling
+# Splunk Queries for Dashboard
 SPLUNK_QUERIES = {
     'total_consumers': '''
         index="datapower" sourcetype="datapower:apimgr:app" catalog_name="prod" 
@@ -623,7 +565,7 @@ SPLUNK_QUERIES = {
     '''
 }
 
-# FIXED: Enhanced mock data function with more realistic data
+# Enhanced mock data function with more realistic data
 def get_mock_data():
     """Enhanced mock data for development and fallback"""
     return {
@@ -693,7 +635,7 @@ def get_mock_data():
         }
     }
 
-# FIXED: Enhanced data processing with better error handling
+# Enhanced data processing with better error handling
 def process_splunk_data(raw_data: List[Dict], query_type: str) -> Dict[str, Any]:
     """Enhanced data processing with pandas for better performance"""
     try:
@@ -778,7 +720,7 @@ def process_splunk_data(raw_data: List[Dict], query_type: str) -> Dict[str, Any]
         logger.error("Error processing Splunk data", error=str(e), query_type=query_type)
         return {'labels': [], 'data': []}
 
-# FIXED: Enhanced dashboard data function with better fallback
+# Enhanced dashboard data function with better fallback
 @cache_result('dashboard_data', ttl=300, use_mock_on_failure=True)
 def get_dashboard_data(time_range: str = '30d', environment: str = 'prod') -> Dict[str, Any]:
     """Enhanced dashboard data fetching with better error handling and automatic fallback"""
@@ -786,8 +728,8 @@ def get_dashboard_data(time_range: str = '30d', environment: str = 'prod') -> Di
         dashboard_data = {}
         earliest_time = f"-{time_range}@d"
         
-        # FIXED: Check if we have a valid Splunk connection before proceeding
-        if not splunk.session_key and not splunk.connect():
+        # Check if we have a Splunk connector and can connect
+        if not splunk or not splunk.config.get('auth_token'):
             logger.warning("No Splunk connection available, using mock data")
             return get_mock_data()
         
@@ -818,10 +760,10 @@ def get_dashboard_data(time_range: str = '30d', environment: str = 'prod') -> Di
                 logger.info("Executing query", query_name=query_name, environment=environment, time_range=time_range)
                 
                 try:
-                    result = splunk.execute_query(query, earliest_time, timeout=20)  # Reduced timeout
+                    result = splunk.execute_query(query, earliest_time, timeout=20)
                     processed_result = process_splunk_data(result, query_name)
                     
-                    # FIXED: Only add result if it has actual data
+                    # Only add result if it has actual data
                     if processed_result and (processed_result.get('labels') or processed_result.get('datasets')):
                         dashboard_data[query_name] = processed_result
                         successful_queries += 1
@@ -831,7 +773,7 @@ def get_dashboard_data(time_range: str = '30d', environment: str = 'prod') -> Di
                 except Exception as query_error:
                     logger.error("Query execution failed", query_name=query_name, error=str(query_error))
         
-        # FIXED: If we got some data, continue; if no queries succeeded, use mock data
+        # If we got some data, continue; if no queries succeeded, use mock data
         if successful_queries == 0:
             logger.warning("All Splunk queries failed, using mock data")
             return get_mock_data()
@@ -891,7 +833,7 @@ def calculate_summary_stats(dashboard_data: Dict[str, Any]) -> Dict[str, Any]:
                     stats['avg_response_time'] = f"{avg_time:.0f}ms"
         
         # Enhanced request calculation
-        base_requests = stats['total_consumers'] * 1500  # More realistic multiplier
+        base_requests = stats['total_consumers'] * 1500
         stats['total_requests'] = f"{base_requests/1000:.1f}K" if base_requests < 1000000 else f"{base_requests/1000000:.1f}M"
         
         # Calculate error rate
@@ -899,7 +841,6 @@ def calculate_summary_stats(dashboard_data: Dict[str, Any]) -> Dict[str, Any]:
             error_data = dashboard_data['error_analysis'].get('data', [])
             if error_data:
                 total_errors = sum(error_data)
-                # More realistic error rate calculation
                 error_rate = (total_errors / max(base_requests, 1)) * 100
                 stats['error_rate'] = f"{error_rate:.3f}%"
         
@@ -913,7 +854,6 @@ def calculate_summary_stats(dashboard_data: Dict[str, Any]) -> Dict[str, Any]:
                 total_apis = len(consumers_array)
                 
                 if total_apis > 0:
-                    # Weighted reusability score
                     reuse_score = ((high_reuse * 1.0) + (medium_reuse * 0.6)) / total_apis * 100
                     stats['reuse_score'] = f"{reuse_score:.0f}%"
         
@@ -937,7 +877,7 @@ def dashboard():
     """Serve the main dashboard"""
     return render_template('dashboard.html')
 
-# FIXED: Enhanced dashboard data endpoint with better error handling
+# Enhanced dashboard data endpoint with better error handling
 @app.route('/api/dashboard-data')
 def api_dashboard_data():
     """Enhanced API endpoint with validation, caching, and fallback"""
@@ -953,7 +893,7 @@ def api_dashboard_data():
         # Get dashboard data with automatic fallback
         data = get_dashboard_data(args['time_range'], args['environment'])
         
-        # FIXED: Always ensure we have the required structure for frontend
+        # Always ensure we have the required structure for frontend
         if not data or 'stats' not in data:
             logger.warning("Dashboard data missing required fields, using mock data")
             data = get_mock_data()
@@ -970,7 +910,7 @@ def api_dashboard_data():
             'timestamp': datetime.now().isoformat()
         }
         
-        # FIXED: Add status indicator for frontend
+        # Add status indicator for frontend
         if data.get('metadata', {}).get('data_source') == 'splunk':
             transformed_data['status'] = 'connected'
         else:
@@ -980,7 +920,7 @@ def api_dashboard_data():
         
     except Exception as e:
         logger.error("Error in dashboard data endpoint", error=str(e))
-        # FIXED: Return mock data instead of error to prevent frontend crashes
+        # Return mock data instead of error to prevent frontend crashes
         mock_data = get_mock_data()
         return jsonify({
             'topApis': mock_data.get('top_apis_by_consumers', {}),
@@ -1006,23 +946,21 @@ def direct_splunk_search():
         search_query = request_data['search']
         earliest_time = request_data.get('earliest_time', '-30d@d')
         latest_time = request_data.get('latest_time', 'now')
-        timeout = int(request_data.get('timeout', 30))  # Reduced default timeout
+        timeout = int(request_data.get('timeout', 30))
         
         logger.info("Direct Splunk search request", 
                    query_preview=search_query[:100],
                    earliest_time=earliest_time,
                    latest_time=latest_time)
         
-        # FIXED: Try to ensure valid session, but don't fail if we can't connect
-        if not splunk.session_key:
-            if not splunk.connect():
-                return jsonify({
-                    'error': 'Unable to establish Splunk connection',
-                    'details': 'Service unavailable',
-                    'connection_attempts': splunk.connection_attempts
-                }), 503
+        # Check if we have a Splunk connector
+        if not splunk or not splunk.config.get('auth_token'):
+            return jsonify({
+                'error': 'Splunk not configured',
+                'details': 'No authentication token available'
+            }), 503
         
-        # Prepare search URL and data exactly as you specified
+        # Prepare search URL and data
         search_url = f"{splunk.base_url}/services/search/jobs"
         
         search_data = {
@@ -1033,7 +971,7 @@ def direct_splunk_search():
         
         headers = {
             'Content-Type': 'application/x-www-form-urlencoded',
-            'Authorization': f'Bearer {splunk.session_key}'
+            'Authorization': f'Bearer {splunk.config["auth_token"]}'
         }
         
         # Make the request
@@ -1042,7 +980,7 @@ def direct_splunk_search():
             search_url,
             data=search_data,
             headers=headers,
-            timeout=timeout + 5  # Reduced buffer
+            timeout=timeout + 5
         )
         
         response.raise_for_status()
@@ -1058,14 +996,14 @@ def direct_splunk_search():
         results_url = f"{splunk.base_url}/services/search/jobs/{job_sid}/results"
         results_params = {
             'output_mode': 'json',
-            'count': 1000  # Limit results
+            'count': 1000
         }
         
         results_response = splunk.session.get(
             results_url,
             params=results_params,
             headers=headers,
-            timeout=15  # Shorter timeout
+            timeout=15
         )
         
         results_response.raise_for_status()
@@ -1093,9 +1031,6 @@ def direct_splunk_search():
         logger.error("Direct search HTTP error", error=str(e), status_code=e.response.status_code)
         
         if e.response.status_code == 401:
-            # Clear session and try to reconnect
-            splunk.session_key = None
-            splunk.session_expiry = None
             return jsonify({'error': 'Authentication failed', 'details': error_msg}), 401
         
         return jsonify({'error': error_msg}), 500
@@ -1108,31 +1043,30 @@ def direct_splunk_search():
         logger.error("Direct search failed", error=str(e))
         return jsonify({'error': 'Search request failed', 'details': str(e)}), 500
 
-# FIXED: Enhanced health check with better connection status
+# Enhanced health check with better connection status
 @app.route('/api/health')
 def health_check():
-    """Enhanced health check with SID session details and connection testing"""
+    """Enhanced health check with connection details"""
     try:
-        # Attempt lazy connection if we don't have one
-        if not splunk.session_key:
-            connection_success = splunk.connect()
-        else:
-            connection_success = splunk.is_session_valid()
+        # Attempt connection test if we have a connector
+        connection_success = False
+        if splunk and splunk.config.get('auth_token'):
+            connection_success = splunk.test_connection()
         
         splunk_status = "connected" if connection_success else "disconnected"
-        session_status = splunk.get_session_status()
+        session_status = splunk.get_session_status() if splunk else {}
         
         health_data = {
-            'status': 'healthy' if splunk_status == 'connected' and session_status['session_valid'] else 'degraded',
+            'status': 'healthy' if connection_success else 'degraded',
             'timestamp': datetime.now().isoformat(),
             'services': {
                 'splunk': {
                     'status': splunk_status,
-                    'host': app.config['SPLUNK_HOST'],
-                    'connection_attempts': splunk.connection_attempts,
+                    'host': app.config['SPLUNK_HOST'] if splunk else 'not_configured',
+                    'connection_attempts': session_status.get('connection_attempts', 0),
                     'session': session_status,
-                    'auth_method': 'token' if app.config.get('SPLUNK_AUTH_TOKEN') else 'username_password',
-                    'last_connection_attempt': session_status.get('last_connection_attempt')
+                    'auth_method': 'token',
+                    'has_token': bool(app.config.get('SPLUNK_AUTH_TOKEN'))
                 },
                 'cache': {
                     'type': 'memory',
@@ -1266,28 +1200,6 @@ def export_data(format):
                 ('GRID', (0, 0), (-1, -1), 1, colors.black)
             ]))
             elements.append(kpi_table)
-            elements.append(Spacer(1, 20))
-            
-            # Top APIs
-            elements.append(Paragraph("Top APIs by Consumer Count", styles['Heading1']))
-            top_apis = data.get('top_apis_by_consumers', {})
-            if top_apis.get('labels') and top_apis.get('data'):
-                api_data = [['API Name', 'Consumer Count']]
-                for api, count in zip(top_apis['labels'][:10], top_apis['data'][:10]):
-                    api_data.append([str(api), str(count)])
-                
-                api_table = Table(api_data)
-                api_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, 0), 12),
-                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                    ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black)
-                ]))
-                elements.append(api_table)
             
             # Build PDF
             doc.build(elements)
@@ -1309,7 +1221,7 @@ def metrics():
     """Prometheus metrics endpoint"""
     return generate_latest(), 200, {'Content-Type': CONTENT_TYPE_LATEST}
 
-# FIXED: Background Tasks - Only start if needed
+# Background Tasks - Only start if needed
 def background_cache_refresh():
     """Enhanced cache management for in-memory cache"""
     while True:
@@ -1338,15 +1250,12 @@ def background_cache_refresh():
 def scheduled_health_check():
     """Enhanced health monitoring with less aggressive connection attempts"""
     try:
-        # Only check session validity, don't force reconnection
-        if splunk.session_key and not splunk.is_session_valid():
-            logger.info("Session expired during health check")
-            splunk.session_key = None
-            splunk.session_expiry = None
-        
-        # Update Prometheus metrics
-        if splunk.session_key and splunk.is_session_valid():
-            ACTIVE_CONNECTIONS.set(1)
+        # Update Prometheus metrics based on connection status
+        if splunk and splunk.config.get('auth_token'):
+            if splunk.test_connection():
+                ACTIVE_CONNECTIONS.set(1)
+            else:
+                ACTIVE_CONNECTIONS.set(0)
         else:
             ACTIVE_CONNECTIONS.set(0)
             
@@ -1378,7 +1287,7 @@ if __name__ == '__main__':
     # Create templates directory if it doesn't exist
     os.makedirs('templates', exist_ok=True)
     
-    # FIXED: Start background tasks in separate threads only if needed
+    # Start background tasks in separate threads only if needed
     if not app.config['DEBUG']:
         # Start cache refresh thread
         cache_thread = threading.Thread(target=background_cache_refresh, daemon=True)
@@ -1391,12 +1300,15 @@ if __name__ == '__main__':
         logger.info("Background tasks started")
     
     # Try to establish initial Splunk connection (non-blocking)
-    try:
-        connection_thread = threading.Thread(target=splunk.connect, daemon=True)
-        connection_thread.start()
-        logger.info("Initial Splunk connection attempt started in background")
-    except Exception as e:
-        logger.warning("Failed to start initial connection thread", error=str(e))
+    if splunk and splunk.config.get('auth_token'):
+        try:
+            connection_thread = threading.Thread(target=splunk.connect, daemon=True)
+            connection_thread.start()
+            logger.info("Initial Splunk connection attempt started in background")
+        except Exception as e:
+            logger.warning("Failed to start initial connection thread", error=str(e))
+    else:
+        logger.warning("No Splunk token configured - dashboard will use mock data")
     
     # Start Flask app
     logger.info("Starting Flask application", host=app.config['HOST'], port=app.config['PORT'])
