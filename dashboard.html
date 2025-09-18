@@ -720,7 +720,8 @@
                     const statusDot = document.getElementById('statusDot');
                     const statusText = document.getElementById('statusText');
                     
-                    if (health.services.splunk.status === 'connected' && health.services.splunk.session.session_valid) {
+                    // FIXED: Check for 'connected' instead of 'session_valid'
+                    if (health.services.splunk.status === 'connected' && health.services.splunk.session.connected) {
                         statusDot.classList.remove('disconnected');
                         statusText.textContent = `✅ Connected to Splunk (${health.services.splunk.host}) - ${health.metrics.cache_entries} cached queries`;
                     } else {
@@ -740,6 +741,7 @@
                     statusText.textContent = '❌ Connection Error - Using Mock Data';
                 }
             }
+
 
             showLoading() {
                 const statValues = document.querySelectorAll('.kpi-value');
