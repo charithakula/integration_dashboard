@@ -1,0 +1,46 @@
+# Stop your current Flask app (Ctrl+C if it's running)
+# Then restart it
+python run.py
+
+curl http://localhost:5000/api/health | python -m json.tool
+
+curl -X POST http://localhost:5000/api/splunk/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "search index=_internal | stats count by sourcetype", "earliest_time": "-1h@h"}'
+
+# This should now work with your .env file
+python -c "
+from splunk_connector import SplunkConnector
+connector = SplunkConnector()
+print('Host:', connector.config.get('host'))
+print('Username:', connector.config.get('username'))
+print('Connection test:', connector.test_connection())
+"
+
+# Test the total consumers query
+curl -X POST http://localhost:5000/api/splunk/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "index=\"datapower\" sourcetype=\"datapower:apimgr:app\" catalog_name=\"prod\" app_name!=\"N/A\" app_name!=\"\" *INTERNAL*OS_* | stats distinct_count(app_name)",   
+    "earliest_time": "-7d@d",
+    "latest_time": "now",
+    "timeout": 60
+  }'
+
+# Test the top APIs query
+curl -X POST http://localhost:5000/api/splunk/search \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "index=\"datapower\" sourcetype=\"datapower:apimgr:app\" catalog_name=\"prod\" app_name!=\"N/A\" app_name!=\"\" *INTERNAL*OS_* | stats distinct_count(app_name) as consumers by api_name | sort - consumers | head 10",
+    "earliest_time": "-30d@d",
+    "latest_time": "now",
+    "timeout": 90
+  }'
+
+curl http://localhost:5000/api/test-query/total_consumers
+
+curl http://localhost:5000/api/test-query/top_apis_by_consumers
+
+curl "http://localhost:5000/api/dashboard-data?time_range=30d&environment=prod" | python -m json.tool
+
+history
